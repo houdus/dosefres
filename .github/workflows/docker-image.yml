@@ -1,5 +1,5 @@
 # ===========================================================================
-# AtlasSync C2 — encrypted-source image build (r19)
+# AtlasSync C2 — encrypted-source image build (r20)
 #
 # For a repo where the source is NOT stored in cleartext: you upload only a
 # 7-Zip AES-encrypted archive (linux.zip) of the linux kit, plus this file at
@@ -20,11 +20,23 @@
 # Both layouts are detected: the archive with the linux/ folder inside, or
 # the folder's contents at the archive root.
 #
+# PUSH CREDENTIALS (r20 fix for "error from registry: denied"):
+#   GHCR can accept every image LAYER and then deny the final manifest with
+#   "denied" when the package already exists but is NOT linked to this
+#   repository (created earlier by a manual `docker push` from your machine).
+#   Two ways to guarantee the push succeeds:
+#     * default: the built-in GITHUB_TOKEN — this workflow declares
+#       packages:write below; it creates and pushes the package as long as
+#       no unlinked package of the same name exists;
+#     * bulletproof: a classic PAT with write:packages saved as the GHCR_PAT
+#       repository secret (Settings -> Secrets and variables -> Actions).
+#       The workflow tries it FIRST — a PAT can always push to your own
+#       package, linked or not.
+#
 # Notes:
 #   - workflow_dispatch input values are visible to repo collaborators on
 #     the run page. Keep the repo private, or leave the input empty and put
 #     the password in the ZIP_PASSWORD repository secret instead.
-#   - the GITHUB_TOKEN already has packages:write — no extra secrets needed.
 # ===========================================================================
 name: Build AtlasSync image (encrypted source)
 
@@ -112,12 +124,47 @@ jobs:
       - name: Build and push the runtime image to GHCR
         env:
           GHCR_IMAGE: ghcr.io/${{ github.repository }}
+          GHCR_PAT: ${{ secrets.GHCR_PAT }}        # optional, tried first
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # built-in, repo-scoped
         run: |
-          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
           # docker image names must be lowercase
           IMAGE="${GHCR_IMAGE,,}"
-          docker build --target runtime -t "$IMAGE:${{ inputs.image_tag }}" "${{ steps.ctx.outputs.dir }}"
-          docker push "$IMAGE:${{ inputs.image_tag }}"
+          TAG="${{ inputs.image_tag }}"
+          docker build --target runtime -t "$IMAGE:$TAG" "${{ steps.ctx.outputs.dir }}"
+
+          # push_with <password>: login + push, exit status tells success.
+          push_with() {
+            echo "$1" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+            docker push "$IMAGE:$TAG"
+          }
+
+          # PAT first (it always works on your own packages), then the
+          # repo-scoped GITHUB_TOKEN.
+          PUSHED=0
+          if [ -n "$GHCR_PAT" ] && push_with "$GHCR_PAT"; then
+            PUSHED=1
+          fi
+          if [ "$PUSHED" = 0 ] && push_with "$GHCR_TOKEN"; then
+            PUSHED=1
+          fi
+
+          if [ "$PUSHED" = 0 ]; then
+            echo "::error::push to $IMAGE:$TAG was DENIED — the image build itself succeeded"
+            echo "GHCR accepted every layer but refused the manifest: the package exists"
+            echo "already but is NOT linked to this repository (it was created earlier by"
+            echo "a manual 'docker push' from your machine). ANY one of these fixes it:"
+            echo "  A) fastest: github.com -> your avatar -> Your packages -> dosefres ->"
+            echo "     Package settings -> Delete this package, then re-run this workflow."
+            echo "     The next push recreates it auto-linked to this repo. Nothing of"
+            echo "     value is lost — the image is rebuilt from scratch every run."
+            echo "  B) keep the package: same Package settings page -> 'Manage Actions"
+            echo "     access' -> add this repository with the Write role, then re-run."
+            echo "  C) create a classic PAT with write:packages scope, save it as the"
+            echo "     GHCR_PAT repository secret (Settings -> Secrets and variables ->"
+            echo "     Actions), then re-run — this workflow pushes with it automatically."
+            exit 1
+          fi
+
           echo
-          echo "image: $IMAGE:${{ inputs.image_tag }}"
-          echo "deploy it with: C2_ENROLL_SECRET + C2_UI_TOKEN env vars set (container disks are ephemeral)"
+          echo "image: $IMAGE:$TAG"
+          echo "deploy it with C2_ENROLL_SECRET + C2_UI_TOKEN env vars set (container disks are ephemeral)"
