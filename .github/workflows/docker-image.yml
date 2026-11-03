@@ -1,0 +1,225 @@
+# =============================================================================
+# AtlasSync — build the Linux Docker image on GitHub Actions (r19)
+#
+# REPO SHAPE THIS EXPECTS (your setup):
+#
+#   <repo>/
+#   ├── linux.zip                      the linux/ folder, zipped by 7-Zip
+#   │                                  WITH PASSWORD (AES-256 recommended)
+#   └── .github/workflows/build.yaml   this file
+#
+# HOW IT RUNS:
+#   GitHub → Actions → "Build AtlasSync server image" → Run workflow
+#   → GitHub PROMPTS for the password (input type: password — masked, never
+#     stored, never printed in logs) plus optional tag/flags
+#   → the runner installs 7-Zip, unpacks linux.zip with that password,
+#     locates the Dockerfile (the linux folder is a self-contained module,
+#     r18+), builds the image, smoke-tests it via /healthz, and ships it.
+#
+# CREATE THE ZIP LOCALLY (from the folder that CONTAINS linux/):
+#   7z a -tzip -mem=AES256 -p linux.zip linux
+#   (7-Zip GUI: AES-256 = "Zip crypto: AES-256" in the add dialog.
+#    AES-256 matters: 7-Zip's default zip crypto is the weak legacy ZipCrypto.)
+#
+# WHAT YOU GET BACK:
+#   1. ghcr.io/<owner>/atlassync-server:<tag>       (pushed; private package)
+#   2. Workflow artifact atlassync-image-<tag>.tar.gz
+#      → download, then:  docker load -i atlassync-image-<tag>.tar.gz
+#
+# NOTES:
+#   - The image build itself NEVER needs the password — only the unpack does.
+#   - The kit's own .dockerignore keeps bin/ and data/ (the enrollment
+#     secret!) out of the image, exactly like a local build.
+#   - A full-tree checkout (linux/ as a plain folder, no zip) also works:
+#     the workflow falls back to searching the repo for the Dockerfile.
+# =============================================================================
+
+name: Build AtlasSync server image
+
+on:
+  workflow_dispatch:
+    inputs:
+      password:
+        description: "7-Zip password for linux.zip"
+        required: true
+        type: password
+      image_tag:
+        description: "Docker image tag"
+        required: false
+        default: "latest"
+        type: string
+      push_ghcr:
+        description: "Push the image to ghcr.io"
+        required: false
+        default: true
+        type: boolean
+      build_dev:
+        description: "Also build the dev image (BUILD tab, ~1 GB)"
+        required: false
+        default: false
+        type: boolean
+
+# contents:read  → checkout + release-asset fallback
+# packages:write → ghcr.io push (used only when push_ghcr is ticked)
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    name: unpack · build · smoke-test · ship
+    runs-on: ubuntu-latest
+    env:
+      IMAGE_NAME: atlassync-server
+      TAG: ${{ inputs.image_tag }}
+
+    steps:
+      # ---------------------------------------------------------------- repo --
+      - name: "Checkout (repo root holds linux.zip + this workflow)"
+        uses: actions/checkout@v4
+
+      # ------------------------------------------------------- unpack the zip --
+      - name: Install 7-Zip
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq p7zip-full
+
+      - name: Fetch linux.zip (repo root, else latest release asset)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ ! -f linux.zip ]; then
+            echo "linux.zip not in the repo root — trying the latest release assets"
+            gh release download --pattern 'linux.zip' --clobber || true
+          fi
+          test -f linux.zip || {
+            echo "::error::linux.zip not found (neither in the repo root nor in a release) — commit it next to .github/ and re-run"
+            exit 1
+          }
+          ls -la linux.zip
+
+      - name: Unpack linux.zip with the prompted password
+        env:
+          ZPASS: ${{ inputs.password }}
+        run: |
+          # belt and braces: mask the password in every possible log path
+          echo "::add-mask::$ZPASS"
+          # -p<pw> comes from the env — the raw password is never on a command
+          # line in the log; 7-Zip itself never prints it either.
+          7z x -y -p"$ZPASS" -olinux-src linux.zip
+          echo "unpacked:"
+          find linux-src -maxdepth 2 -type d | sed 's/^/  /'
+
+      # --------------------------------------------------------- find context --
+      - name: Locate the Docker build context (the linux folder)
+        id: ctx
+        run: |
+          # the zip may contain the folder (linux/…) or its contents at the
+          # root; a full-tree checkout works too. Prefer the fresh extraction.
+          CTX="$(dirname "$(find linux-src -maxdepth 2 -name Dockerfile -print -quit 2>/dev/null)")"
+          if [ -z "$CTX" ] || [ ! -f "$CTX/Dockerfile" ]; then
+            CTX="$(dirname "$(find . -path ./.git -prune -o -name Dockerfile -print -quit)")"
+          fi
+          if [ -z "$CTX" ] || [ ! -f "$CTX/Dockerfile" ]; then
+            echo "::error::no Dockerfile found after unpacking linux.zip"
+            exit 1
+          fi
+          # r18+ sanity: the context must be a SELF-CONTAINED module
+          if [ ! -f "$CTX/go.mod" ]; then
+            echo "::error::$CTX has a Dockerfile but no go.mod — pre-r18 linux folder (it needed the parent tree). Re-zip the r18+ linux/ folder."
+            exit 1
+          fi
+          echo "context=$CTX" >> "$GITHUB_OUTPUT"
+          echo "build context: $CTX"
+
+      # -------------------------------------------------------------- build ----
+      - name: Docker build (runtime image)
+        run: |
+          docker build --pull -t "$IMAGE_NAME:$TAG" "${{ steps.ctx.outputs.context }}"
+
+      - name: Docker build (dev image, optional)
+        if: inputs.build_dev == true
+        run: |
+          docker build --pull --target dev -t "$IMAGE_NAME:dev" "${{ steps.ctx.outputs.context }}"
+
+      # -------------------------------------------------------- smoke test ----
+      # Prove the image actually serves before shipping it: boot the
+      # container and hit the unauthenticated /healthz endpoint.
+      - name: Smoke test (/healthz must answer 200)
+        run: |
+          docker run -d --name smoke -p 127.0.0.1:18443:8443 "$IMAGE_NAME:$TAG"
+          ok=""
+          for i in $(seq 1 30); do
+            code="$(curl -sk -o /dev/null -w '%{http_code}' https://127.0.0.1:18443/healthz || true)"
+            if [ "$code" = "200" ]; then ok=1; break; fi
+            sleep 2
+          done
+          echo "--- container log (last lines) ---"
+          docker logs smoke 2>&1 | tail -5
+          docker rm -f smoke >/dev/null
+          if [ -z "$ok" ]; then
+            echo "::error::/healthz never answered 200 — image rejected"
+            exit 1
+          fi
+          echo "smoke test passed: /healthz → 200"
+
+      # ----------------------------------------------------------- artifact ---
+      - name: Save image(s) as downloadable tarball(s)
+        run: |
+          mkdir -p out
+          docker save "$IMAGE_NAME:$TAG" | gzip > "out/${IMAGE_NAME}-${TAG}.tar.gz"
+          if [ "${{ inputs.build_dev }}" = "true" ]; then
+            docker save "$IMAGE_NAME:dev" | gzip > "out/${IMAGE_NAME}-dev-${TAG}.tar.gz"
+          fi
+          ls -la out/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: atlassync-image-${{ inputs.image_tag }}
+          path: out/*.tar.gz
+          if-no-files-found: error
+          retention-days: 30
+
+      # -------------------------------------------------------------- ghcr ----
+      - name: Login to ghcr.io
+        if: inputs.push_ghcr == true
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Push to ghcr.io
+        if: inputs.push_ghcr == true
+        run: |
+          # ghcr requires lowercase owner/repository
+          OWNER="${{ github.repository_owner }}"
+          OWNER="${OWNER,,}"
+          IMAGE="ghcr.io/${OWNER}/${IMAGE_NAME}"
+          docker tag  "$IMAGE_NAME:$TAG" "$IMAGE:$TAG"
+          docker push "$IMAGE:$TAG"
+          if [ "${{ inputs.build_dev }}" = "true" ]; then
+            docker tag  "$IMAGE_NAME:dev" "$IMAGE:dev"
+            docker push "$IMAGE:dev"
+          fi
+          echo "PUSHED=$IMAGE" >> "$GITHUB_ENV"
+
+      # ------------------------------------------------------------ summary ---
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "## AtlasSync image build"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| context | \`${{ steps.ctx.outputs.context }}\` |"
+            echo "| image | \`$IMAGE_NAME:$TAG\` |"
+            echo "| ghcr | ${PUSHED:-not pushed} |"
+            echo "| artifact | \`atlassync-image-${TAG}.tar.gz\` (docker load -i …) |"
+            echo ""
+            echo '```'
+            docker images "$IMAGE_NAME" --format "{{.Repository}}:{{.Tag}}  {{.Size}}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
